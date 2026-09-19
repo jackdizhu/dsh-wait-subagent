@@ -1,0 +1,5 @@
+# dsh-wait-subagent — profile patch layer
+# Inserts one loader entry for the plugin package.
+- insert:
+    - id: wait-subagent
+      name: 'dsh-wait-subagent'

@@ -1,0 +1,12 @@
+# awesome-dsh-plugin 投稿草稿（data/plugins/john-walks-slow__dsh-wait-subagent.yml）
+# 前置：仓库满 1 天后提 PR。流程：fork awesome-dsh-plugin → 只加这一个文件 → PR。
+# 注意：description 含 ": " 必须加引号；描述会被对着代码核，只写实际行为。
+# 搜索机制（dsh-market 实测源码）：索引 name/npm/owner/description(en+zh)/category，
+# 不索引 README 与 npm keywords——双语描述是唯一搜索优化面。
+# category 取参考分类表中的 tools（插件本质是注册一个模型可调用工具）。
+url: https://github.com/john-walks-slow/dsh-wait-subagent
+name: john-walks-slow/dsh-wait-subagent
+category: tools
+description:
+  en: 'Active wait for background subagents in DeepSeek Harness: registers a wait_subagent model tool that blocks until a named background continuable subagent settles, then returns its stop reason and closing message — optional timeout, membership gate rejects unknown ids, event-driven with zero polling. Closes the gap between run_in_background fire-and-return and the async settlement notice; wait for a background subagent without polling list_agents.'
+  zh: '为 DeepSeek Harness 提供后台子代理的主动等待：注册 wait_subagent 模型工具，阻塞等待指定的后台 continuable（可续会话）子代理收尾（settlement），返回停止原因与收尾消息——可选超时、成员资格门控拒绝未知 id、事件驱动零轮询。补齐 run_in_background 发后不管与异步收尾通知之间的缺口：等待后台子代理（subagent wait）不再轮询 list_agents、不再靠猜。'
