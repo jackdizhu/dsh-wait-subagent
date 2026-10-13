@@ -128,3 +128,7 @@ Verify with `npm view dsh-wait-subagent version`.
 ## License
 
 MIT
+
+## Community
+
+- Thanks to the [LINUX DO](https://linux.do/) community for providing the discussion environment.
