@@ -5,21 +5,28 @@
  * Run: node scripts/verify.mjs   (exit code 0 = all checks pass)
  *
  * Covers:
- *   1. Static assertions: no legacy tool names in lib/index.js,
- *      package.json, README.md, README.zh-CN.md; all four new tool names
- *      present in each file.
+ *   1. Static assertions across every .js file under lib/ (recursive) plus
+ *      package.json, README.md, README.zh-CN.md:
+ *        - no legacy tool names (get_subagent_status's pre-rename spelling,
+ *          wait_any_subagent) anywhere;
+ *        - all four new tool names present somewhere in lib/ (directory-
+ *          level existence, files may divide the mentions) and, per file,
+ *          in package.json / README.md / README.zh-CN.md.
+ *   1b. Line budget: every lib/ .js file is <= 400 lines (per-file counts
+ *       are printed).
  *   2. package.json parses and version === "1.2.0".
  *   3. Dynamic import of lib/index.js: name / inject / apply exports.
  *   4. Mock functional tests through the real defineTool pipeline
  *      (wait_every_subagent settled / timeout / pre-settled,
  *       wait_some_subagent first-of-N, unknown-id rejection,
- *       get_subagent_status running/settled).
+ *       get_subagent_status running/settled) — these assert behavior, so
+ *       the multi-file split must keep them passing unchanged.
  *
  * If @deepseek-ai/dsh-tools fails to resolve, runs `npm install` in the
  * project root once, then retries the import.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { execSync } from "node:child_process";
@@ -119,15 +126,37 @@ function renderText(def, args, value) {
   return blocks.map((b) => (b && typeof b.text === "string" ? b.text : "")).join("\n");
 }
 
+/** Editor-style line count: physical lines, trailing newline not a line. */
+function lineCount(text) {
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines.length;
+}
+
+/** Every .js file under lib/, recursive, as slash-separated repo-relative paths. */
+function collectLibJsFiles() {
+  const libDir = path.join(root, "lib");
+  return readdirSync(libDir, { recursive: true })
+    .filter((rel) => rel.endsWith(".js") && statSync(path.join(libDir, rel)).isFile())
+    .map((rel) => `lib/${rel.split(path.sep).join("/")}`)
+    .sort();
+}
+
 // ---------------------------------------------------------------------------
 // Checks
 // ---------------------------------------------------------------------------
 
 async function main() {
   // -- 1. Static assertions -------------------------------------------------
-  const staticFiles = ["lib/index.js", "package.json", "README.md", "README.zh-CN.md"];
+  // Scan scope: every .js file under lib/ (recursive) + package.json +
+  // README.md + README.zh-CN.md. Legacy names must appear nowhere; the four
+  // new tool names must exist somewhere in lib/ as a whole (the split may
+  // distribute mentions across files), and still per-file in package.json
+  // and the two READMEs.
+  const libJsFiles = collectLibJsFiles();
+  const scannedFiles = [...libJsFiles, "package.json", "README.md", "README.zh-CN.md"];
   const texts = new Map(
-    staticFiles.map((f) => [f, readFileSync(path.join(root, f), "utf8")]),
+    scannedFiles.map((f) => [f, readFileSync(path.join(root, ...f.split("/")), "utf8")]),
   );
   const legacyPatterns = [/(?<!get_)subagent_status/, /wait_any_subagent/];
   const newTools = ["wait_subagent", "get_subagent_status", "wait_some_subagent", "wait_every_subagent"];
@@ -140,12 +169,30 @@ async function main() {
       });
     }
   }
-  for (const [file, text] of texts) {
+
+  const libCombined = libJsFiles.map((f) => texts.get(f)).join("\n");
+  for (const tool of newTools) {
+    await check(`static: lib/ (whole directory) mentions "${tool}"`, () => {
+      assert(libCombined.includes(tool), `"${tool}" missing from the entire lib/ directory`);
+    });
+  }
+
+  const nonLibFiles = scannedFiles.filter((f) => !f.startsWith("lib/"));
+  for (const file of nonLibFiles) {
     for (const tool of newTools) {
       await check(`static: ${file} mentions "${tool}"`, () => {
-        assert(text.includes(tool), `"${tool}" missing from ${file}`);
+        assert(texts.get(file).includes(tool), `"${tool}" missing from ${file}`);
       });
     }
+  }
+
+  // -- 1b. lib/ line budget (multi-file split) ------------------------------
+  for (const file of libJsFiles) {
+    await check(`line count: ${file} <= 400 lines`, () => {
+      const n = lineCount(texts.get(file));
+      console.log(`      ${file}: ${n} lines`);
+      assert(n <= 400, `${file} has ${n} lines — exceeds the 400-line cap`);
+    });
   }
 
   // -- 2. package.json -------------------------------------------------------
