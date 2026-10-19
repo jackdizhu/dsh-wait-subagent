@@ -182,7 +182,7 @@ Restart your DSH instance after installing; the bundled `cordis.patch.yml` regis
 - **What it touches**: registers exactly four model-facing Agent tools (`wait_subagent`, `get_subagent_status`, `wait_some_subagent`, `wait_every_subagent`) on every root agent. No web client, no UI changes, no configuration.
 - **Blocking semantics**: the waiting tools hold the calling agent's tool lane until the targets settle, the optional timeout elapses, or the caller aborts — that is the feature. The wait itself is event-driven (`subagent/end` lifecycle event), not polling; CPU cost while blocked is negligible. `get_subagent_status` returns immediately and never blocks. An omit-`timeout_ms` wait is unbounded by design; set a generous `timeout_ms` when you need a bound.
 - **No side effects**: no network requests, no external services, no filesystem writes. The activity table lives in plugin process memory only (cleared on restart).
-- **Dependencies**: `@deepseek-ai/dsh-tools` 0.1.2-rc.1 (aligned with the dsh 0.1.2-rc.1 locked version), Node ≥ 22.5.
+- **Dependencies**: none at runtime — `@deepseek-ai/dsh-tools` is a peer dependency provided by the DSH host (`^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`), Node ≥ 22.5. Dev/validation pin: 0.1.2-rc.1 (devDependencies).
 
 ## Local development
 

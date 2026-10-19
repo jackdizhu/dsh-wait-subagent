@@ -14,7 +14,7 @@
  *          in package.json / README.md / README.zh-CN.md.
  *   1b. Line budget: every lib/ .js file is <= 400 lines (per-file counts
  *       are printed).
- *   2. package.json parses and version === "1.2.0".
+ *   2. package.json parses and version === "1.2.1".
  *   3. Dynamic import of lib/index.js: name / inject / apply exports.
  *   4. Mock functional tests through the real defineTool pipeline
  *      (wait_every_subagent settled / timeout / pre-settled,
@@ -197,9 +197,17 @@ async function main() {
 
   // -- 2. package.json -------------------------------------------------------
   let pkg;
-  await check("package.json parses; version === 1.2.0", () => {
+  await check("package.json parses; version === 1.2.1", () => {
     pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
-    assert(pkg.version === "1.2.0", `version is ${pkg.version}, expected 1.2.0`);
+    assert(pkg.version === "1.2.1", `version is ${pkg.version}, expected 1.2.1`);
+  });
+
+  await check("DEFECT-02 guard: dsh-tools is peer+dev only, never a runtime dep", () => {
+    assert(!pkg.dependencies || !pkg.dependencies["@deepseek-ai/dsh-tools"], "dsh-tools must not appear in dependencies (DEFECT-02)");
+    const peer = pkg.peerDependencies && pkg.peerDependencies["@deepseek-ai/dsh-tools"];
+    assert(typeof peer === "string" && peer.includes("0.1.2-rc.1") && peer.includes("0.2.0-rc.2"), "peerDependencies missing/invalid dsh-tools range");
+    assert(pkg.peerDependenciesMeta && pkg.peerDependenciesMeta["@deepseek-ai/dsh-tools"] && pkg.peerDependenciesMeta["@deepseek-ai/dsh-tools"].optional === true, "peerDependenciesMeta optional:true required");
+    assert(pkg.devDependencies && pkg.devDependencies["@deepseek-ai/dsh-tools"] === "0.1.2-rc.1", "devDependencies dsh-tools must pin 0.1.2-rc.1");
   });
 
   // -- 3. Import the plugin ----------------------------------------------------

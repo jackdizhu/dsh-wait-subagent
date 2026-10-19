@@ -178,7 +178,7 @@ dsh plugin --profile web add github:john-walks-slow/dsh-wait-subagent
 - **涉及范围**：在每个 root agent 上注册四个模型可调用的 Agent 工具（`wait_subagent` / `get_subagent_status` / `wait_some_subagent` / `wait_every_subagent`）。无 web client、无 UI 改动、无配置项。
 - **阻塞语义**：等待类工具占用调用方 agent 的工具通道，直到目标子代理收尾、可选超时到期或调用方中止——这正是功能本身。等待机制是事件驱动（`subagent/end` 生命周期事件），非轮询，阻塞期间 CPU 占用可忽略。`get_subagent_status` 立即返回不阻塞。省略 `timeout_ms` 的等待不设上限（设计如此）；需要上限时请给足量级的 `timeout_ms`。
 - **无副作用**：无网络请求、无外部服务、无文件系统写入。活动表仅存于插件进程内存（重启即清空）。
-- **依赖**：`@deepseek-ai/dsh-tools` 0.1.2-rc.1（与 dsh 0.1.2-rc.1 锁定版本对齐），Node ≥ 22.5。
+- **依赖**：运行时零依赖——`@deepseek-ai/dsh-tools` 为 peer 依赖，由 DSH 宿主提供（兼容范围：`^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`），Node ≥ 22.5。本地开发/验证钉版 0.1.2-rc.1（devDependencies）。
 
 ## 本地开发
 
