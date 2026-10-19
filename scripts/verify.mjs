@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dsh-wait-subagent v1.2 acceptance checks (no test framework, node >= 22).
+ * dsh-wait-subagent v1.3 acceptance checks (no test framework, node >= 22).
  *
  * Run: node scripts/verify.mjs   (exit code 0 = all checks pass)
  *
@@ -9,17 +9,19 @@
  *      package.json, README.md, README.zh-CN.md:
  *        - no legacy tool names (get_subagent_status's pre-rename spelling,
  *          wait_any_subagent) anywhere;
- *        - all four new tool names present somewhere in lib/ (directory-
+ *        - all five tool names present somewhere in lib/ (directory-
  *          level existence, files may divide the mentions) and, per file,
  *          in package.json / README.md / README.zh-CN.md.
  *   1b. Line budget: every lib/ .js file is <= 400 lines (per-file counts
  *       are printed).
- *   2. package.json parses and version === "1.2.1".
+ *   2. package.json parses and version === "1.3.0".
  *   3. Dynamic import of lib/index.js: name / inject / apply exports.
  *   4. Mock functional tests through the real defineTool pipeline
  *      (wait_every_subagent settled / timeout / pre-settled,
  *       wait_some_subagent first-of-N, unknown-id rejection,
- *       get_subagent_status running/settled) — these assert behavior, so
+ *       get_subagent_status running/settled,
+ *       send_to_subagent steer/followup/foreign-id/already-settled/
+ *       feature-detection/empty-message) — these assert behavior, so
  *       the multi-file split must keep them passing unchanged.
  *
  * If @deepseek-ai/dsh-tools fails to resolve, runs `npm install` in the
@@ -69,6 +71,22 @@ function makeMock({ children = [], live = [] } = {}) {
   const registeredTools = [];
   const liveSet = new Set(live);
 
+  // One stable live child object per live id: status + steer/followup spies
+  // (spy arrays record each call's argument) for the send_to_subagent tests.
+  const liveAgents = new Map(
+    live.map((id) => {
+      const child = {
+        id,
+        status: "running",
+        steer: (msg) => child.steerCalls.push(msg),
+        followup: (msg) => child.followupCalls.push(msg),
+        steerCalls: [],
+        followupCalls: [],
+      };
+      return [id, child];
+    }),
+  );
+
   const agent = {
     id: "root-agent-0",
     ctx: {
@@ -99,7 +117,11 @@ function makeMock({ children = [], live = [] } = {}) {
     },
     agents: {
       roots: () => [agent],
-      get: (id) => (liveSet.has(id) ? { id } : undefined),
+      // Live registry: one stable child object per live id, carrying a
+      // status plus steer/followup spies so send_to_subagent tests can
+      // assert exactly which delivery API was invoked. Removing an id from
+      // liveSet simulates settlement (get starts returning undefined).
+      get: (id) => (liveSet.has(id) ? liveAgents.get(id) : undefined),
     },
     subagents: {
       listChildren: async () => children.map((id) => ({ id })),
@@ -107,7 +129,7 @@ function makeMock({ children = [], live = [] } = {}) {
     liveSet,
   };
 
-  return { ctx, agent, registeredTools, liveSet };
+  return { ctx, agent, registeredTools, liveSet, liveAgents };
 }
 
 /** Let the awaited listChildren continuation (listener attach) finish. */
@@ -159,7 +181,13 @@ async function main() {
     scannedFiles.map((f) => [f, readFileSync(path.join(root, ...f.split("/")), "utf8")]),
   );
   const legacyPatterns = [/(?<!get_)subagent_status/, /wait_any_subagent/];
-  const newTools = ["wait_subagent", "get_subagent_status", "wait_some_subagent", "wait_every_subagent"];
+  const newTools = [
+    "wait_subagent",
+    "get_subagent_status",
+    "wait_some_subagent",
+    "wait_every_subagent",
+    "send_to_subagent",
+  ];
 
   for (const [file, text] of texts) {
     for (const pattern of legacyPatterns) {
@@ -197,17 +225,38 @@ async function main() {
 
   // -- 2. package.json -------------------------------------------------------
   let pkg;
-  await check("package.json parses; version === 1.2.1", () => {
+  await check("package.json parses; version === 1.3.0", () => {
     pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
-    assert(pkg.version === "1.2.1", `version is ${pkg.version}, expected 1.2.1`);
+    assert(pkg.version === "1.3.0", `version is ${pkg.version}, expected 1.3.0`);
   });
 
-  await check("DEFECT-02 guard: dsh-tools is peer+dev only, never a runtime dep", () => {
-    assert(!pkg.dependencies || !pkg.dependencies["@deepseek-ai/dsh-tools"], "dsh-tools must not appear in dependencies (DEFECT-02)");
-    const peer = pkg.peerDependencies && pkg.peerDependencies["@deepseek-ai/dsh-tools"];
-    assert(typeof peer === "string" && peer.includes("0.1.2-rc.1") && peer.includes("0.2.0-rc.2"), "peerDependencies missing/invalid dsh-tools range");
-    assert(pkg.peerDependenciesMeta && pkg.peerDependenciesMeta["@deepseek-ai/dsh-tools"] && pkg.peerDependenciesMeta["@deepseek-ai/dsh-tools"].optional === true, "peerDependenciesMeta optional:true required");
-    assert(pkg.devDependencies && pkg.devDependencies["@deepseek-ai/dsh-tools"] === "0.1.2-rc.1", "devDependencies dsh-tools must pin 0.1.2-rc.1");
+  // DEFECT-02 guard, generalized: every peer-provided @deepseek-ai package
+  // (dsh-tools since v1.2.1, dsh-llm since v1.3.0) must be peer+dev only and
+  // must never leak into runtime `dependencies`.
+  const PEER_PACKAGES = ["@deepseek-ai/dsh-tools", "@deepseek-ai/dsh-llm"];
+  await check("DEFECT-02 guard: dsh-tools and dsh-llm are peer+dev only, never runtime deps", () => {
+    for (const pkgName of PEER_PACKAGES) {
+      const short = pkgName.replace("@deepseek-ai/", "");
+      assert(
+        !pkg.dependencies || !pkg.dependencies[pkgName],
+        `${short} must not appear in dependencies (DEFECT-02)`,
+      );
+      const peer = pkg.peerDependencies && pkg.peerDependencies[pkgName];
+      assert(
+        typeof peer === "string" && peer.includes("0.1.2-rc.1") && peer.includes("0.2.0-rc.2"),
+        `peerDependencies missing/invalid ${short} range`,
+      );
+      assert(
+        pkg.peerDependenciesMeta &&
+          pkg.peerDependenciesMeta[pkgName] &&
+          pkg.peerDependenciesMeta[pkgName].optional === true,
+        `peerDependenciesMeta ${short} optional:true required`,
+      );
+      assert(
+        pkg.devDependencies && pkg.devDependencies[pkgName] === "0.1.2-rc.1",
+        `devDependencies ${short} must pin 0.1.2-rc.1`,
+      );
+    }
   });
 
   // -- 3. Import the plugin ----------------------------------------------------
@@ -324,6 +373,123 @@ async function main() {
     m.liveSet.delete("id-a"); // child settled -> removed from the live registry
     const settled = await def.execute({ subagent_id: "id-a" }, { agent: m.agent, signal });
     assertDeepEqual(settled, { status: "settled", subagent_id: "id-a", observed: false }, "settled child");
+  });
+
+  await check("send_to_subagent: running child -> steer called with plugin/relay user message", async () => {
+    const m = makeMock({ children: ["id-a", "id-b"], live: ["id-a", "id-b"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    const child = m.liveAgents.get("id-a");
+    child.status = "running";
+    const value = await def.execute(
+      { subagent_id: "id-a", message: "skip the docs step, go straight to tests" },
+      { agent: m.agent, signal: new AbortController().signal },
+    );
+    assertDeepEqual(value, { delivered: true, subagent_id: "id-a", mode: "steer" }, "steer result");
+    assert(child.steerCalls.length === 1, `steer must be called exactly once, got ${child.steerCalls.length}`);
+    assert(child.followupCalls.length === 0, "followup must not be called for a running child");
+    const msg = child.steerCalls[0];
+    assert(msg && msg.role === "user", "delivered message must be a user-role message");
+    assert(msg.id && typeof msg.id === "string" && msg.id.length > 0, "delivered message must carry a fresh id");
+    assertDeepEqual(msg.content, [{ type: "text", text: "skip the docs step, go straight to tests" }], "steer message content");
+    assert(
+      msg.source && msg.source.kind === "plugin" && msg.source.plugin === "dsh-wait-subagent" && msg.source.form === "relay",
+      "message source must be plugin/relay provenance identifying this plugin",
+    );
+    const text = renderText(def, { subagent_id: "id-a" }, value);
+    assert(text.includes("id-a") && text.includes("steer"), "render text must mention the child id and steer mode");
+  });
+
+  await check("send_to_subagent: idle child -> followup called", async () => {
+    const m = makeMock({ children: ["id-a", "id-b"], live: ["id-a", "id-b"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    const child = m.liveAgents.get("id-b");
+    child.status = "idle";
+    const value = await def.execute(
+      { subagent_id: "id-b", message: "also update the changelog when done" },
+      { agent: m.agent, signal: new AbortController().signal },
+    );
+    assertDeepEqual(value, { delivered: true, subagent_id: "id-b", mode: "followup" }, "followup result");
+    assert(child.followupCalls.length === 1, `followup must be called exactly once, got ${child.followupCalls.length}`);
+    assert(child.steerCalls.length === 0, "steer must not be called for an idle child");
+    const msg = child.followupCalls[0];
+    assert(msg && msg.role === "user", "delivered message must be a user-role message");
+    assertDeepEqual(msg.content, [{ type: "text", text: "also update the changelog when done" }], "followup message content");
+  });
+
+  await check("send_to_subagent: foreign id (not your child) -> rejected", async () => {
+    const m = makeMock({ children: ["id-a", "id-b"], live: ["id-a", "id-b"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    let rejected = false;
+    try {
+      await def.execute(
+        { subagent_id: "id-not-mine", message: "hello" },
+        { agent: m.agent, signal: new AbortController().signal },
+      );
+    } catch (err) {
+      rejected = true;
+      assert(
+        String(err.message).includes("not one of your subagents"),
+        `rejection message should mirror the wait tools' wording, got: ${err.message}`,
+      );
+    }
+    assert(rejected, "send_to_subagent must reject a foreign subagent id");
+  });
+
+  await check("send_to_subagent: own id but settled -> delivered:false + already_settled, no delivery calls", async () => {
+    const m = makeMock({ children: ["id-a", "id-b"], live: ["id-a", "id-b"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    m.liveSet.delete("id-a"); // settled: gone from the live registry
+    const value = await def.execute(
+      { subagent_id: "id-a", message: "anyone there?" },
+      { agent: m.agent, signal: new AbortController().signal },
+    );
+    assertDeepEqual(value, { delivered: false, subagent_id: "id-a", reason: "already_settled" }, "settled result");
+    const text = renderText(def, { subagent_id: "id-a" }, value);
+    assert(
+      text.includes("already settled") && text.includes("NOT delivered"),
+      "render text must honestly report non-delivery and non-revival",
+    );
+  });
+
+  await check("send_to_subagent: legacy host object without steer/followup -> feature-detection error", async () => {
+    const m = makeMock({ children: ["id-a"], live: ["id-a"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    // Simulate an older DSH host: live registry returns a bare object.
+    m.liveAgents.set("id-a", { id: "id-a", status: "running" });
+    let rejected = false;
+    try {
+      await def.execute(
+        { subagent_id: "id-a", message: "ping" },
+        { agent: m.agent, signal: new AbortController().signal },
+      );
+    } catch (err) {
+      rejected = true;
+      assert(
+        String(err.message).includes("does not expose the agent delivery API"),
+        `feature-detection message mismatch, got: ${err.message}`,
+      );
+    }
+    assert(rejected, "send_to_subagent must throw on hosts without the delivery API");
+  });
+
+  await check("send_to_subagent: empty message -> rejected", async () => {
+    const m = makeMock({ children: ["id-a"], live: ["id-a"] });
+    plugin.apply(m.ctx);
+    const def = toolByName(m.registeredTools, "send_to_subagent");
+    for (const bad of ["", "   ", undefined]) {
+      let rejected = false;
+      try {
+        await def.execute({ subagent_id: "id-a", message: bad }, { agent: m.agent, signal: new AbortController().signal });
+      } catch {
+        rejected = true;
+      }
+      assert(rejected, `empty/blank message (${JSON.stringify(bad)}) must be rejected`);
+    }
   });
 
   finish();

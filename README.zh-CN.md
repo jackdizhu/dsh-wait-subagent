@@ -5,12 +5,13 @@
   <a href="./README.zh-CN.md"><strong>简体中文</strong></a>
 </p>
 
-一个 DeepSeek Harness（cordis）插件，注册四个模型可调用的工具：
+一个 DeepSeek Harness（cordis）插件，注册五个模型可调用的工具：
 
 - `wait_subagent` — **主动阻塞等待指定的后台 continuable 子代理收尾（settle），并在同一次调用里拿到它的停止原因与收尾消息**；超时返回附带活动诊断（最后活动时间/轮次/最近输出），可区分「仍在工作」与「疑似停滞」。
 - `get_subagent_status` — **非阻塞探活**：报告子代理是否仍在运行、距最后一次活动多久、最近输出摘要，用于中途判断「进行中 vs 静默停滞」。
 - `wait_some_subagent` — **等待多个后台子代理中首个收尾者**，返回其 id/停止原因/收尾消息，用于并行 fan-out 的逐个收割。
 - `wait_every_subagent` — **屏障：等待列出的所有后台子代理全部收尾**，按入参顺序返回每个子代理的结果外加 `failed` 失败清单，用于下一步需要全部 fan-out 结果的汇合点。
+- `send_to_subagent` — **向自己的后台子代理投递消息**：运行中的子代理在最近 step 边界消费（steer），空闲的子代理以此开启新 turn（followup）；已收尾的子代理如实返回不可投递。
 
 三个等待类工具的**收尾语义均包含异常结束**：`error`、`aborted`、`max-tokens`、`refusal` 都算收尾（与正常结束触发同一个生命周期事件）；靠 `stop_reason` 区分成败，失败的子代理不会挂住等待。
 
@@ -103,20 +104,32 @@ Failed: id-b
 - 调用前已收尾的子代理以 `stop_reason: "unknown"` 报告；异常结束（`error`/`aborted`/`max-tokens`/`refusal`）与正常结束一样触发收尾，不会挂住屏障。
 - 超时时结果在 `pending` 中列出仍在运行的 id（附带活动诊断），不携带部分结果——之后可重新调用该工具，或改用逐个等待。
 
+### send_to_subagent — 运行中 steer / 空闲 followup（v1.3）
+
+```
+send_to_subagent({ subagent_id: "id-a", message: "跳过文档步骤，直接去跑测试" })
+→ { "delivered": true, "subagent_id": "id-a", "mode": "steer" | "followup" }
+```
+
+- **自适应投递**：*运行中*的子代理在最近的 step 边界消费消息（`mode: "steer"`）；*空闲*的子代理以此开启新 turn（`mode: "followup"`）。两条路径都用 `@deepseek-ai/dsh-llm` 的 `createUserMessage` 构造持久化 user 消息，provenance 标明是本插件代调用方父 agent 转发。
+- **已收尾的子代理不可复活**：收尾后子代理已从存活注册表移除，工具如实返回 `{ "delivered": false, "subagent_id": "…", "reason": "already_settled" }`，不会假装投递成功。若工作必须继续，请重派新子代理（或 `subagent_fork`）。
+- 成员资格门控与等待类工具完全一致：不属于你自己的后台子代理的 id 直接报错；旧版 DSH 宿主若未暴露投递 API（`steer`/`followup`），也会响亮报错而非静默失效。
+- 它是 `send_message` 在子代理 id 命名空间的对应物；两者的目标命名空间互不重叠。用途是中途纠偏或给空闲子代理追加指示——不是等待（等待请用等待类工具）。
+
 ## 为什么需要它
 
 现有子代理系统能给你的：
 
 - `subagent` + `run_in_background: true` → 立即返回 `subagentId`，工作异步继续，稍后才送达 settlement 通知。
 - `subagent` + `run_in_background: false` → 只在**启动**时阻塞。
-- `send_message` → 发完即返回，从不等待回答。
+- `send_message` → 发完即返回，从不等待回答（且目标是对话 id 而非子代理 id——`send_to_subagent` 是子代理 id 命名空间的对应物，两者互不重叠）。
 - `list_agents` → 快照，不是等待（且明确提示"不要用来轮询"）。
 
-缺的是：后台启动子代理之后，没有工具能**阻塞等待它完成**。这正是 `wait_subagent` 做的事——当你的下一步依赖子代理的结果时用它，而不是靠猜或轮询。并行派发时按流程选等待形态：`wait_some_subagent` 逐个收割（循环调用），`wait_every_subagent` 在需要全部结果的步骤前做屏障。
+缺的是：后台启动子代理之后，没有工具能**阻塞等待它完成**。这正是 `wait_subagent` 做的事——当你的下一步依赖子代理的结果时用它，而不是靠猜或轮询。并行派发时按流程选等待形态：`wait_some_subagent` 逐个收割（循环调用），`wait_every_subagent` 在需要全部结果的步骤前做屏障。而需要中途纠偏或给空闲子代理追加指示时，`send_to_subagent` 直接投递消息——运行中的子代理在下一个 step 边界消费（steer），空闲的子代理开启新 turn（followup）。
 
 ## 工作原理
 
-- 在每个 root agent 上注册四个工具（与 `dsh-proactive` 相同的注册模式）。
+- 在每个 root agent 上注册五个工具（与 `dsh-proactive` 相同的注册模式）。
 - **成员资格门控**：`ctx.subagents.listChildren(parent.id)` —— 与 `list_agents` 读的同一个 projection —— 同时覆盖存活与仅存于存储的子代理，未知 id 直接报错，而不是被误报为已收尾。已知子代理若不在存活注册表中，说明早已收尾。
 - 等待类工具监听 `subagent/end` 生命周期事件（子代理 activation 被释放时触发），作用域挂在插件上下文上（所有 agent 上下文的公共祖先）。`wait_every_subagent` 从同一事件流为每个列出的 id 记录一条结果，全部记录齐后才解除阻塞。
 - 收尾时，子代理从存活注册表移除与 `subagent/end` 派发发生在同一个同步块里（`finishDisposal`），因此"先挂监听、再复查注册表"的顺序无竞态。此时已不在注册表中的子代理被记为早已收尾（`stop_reason: "unknown"`）。
@@ -153,6 +166,10 @@ wait_every_subagent(subagent_ids: string[2+], timeout_ms?: integer)
     pending?: [ { subagent_id: string, observed: boolean,
                   lastActivityAgoMs?: integer, turnCount?: integer,
                   recentOutputs?: string[] }, … ] } // 仍在运行的 id，timeout 时给出
+
+send_to_subagent(subagent_id: string, message: string)
+→ { delivered: true,  subagent_id: string, mode: "steer" | "followup" }
+  | { delivered: false, subagent_id: string, reason: "already_settled" }
 ```
 
 ## 注意：不要在同一步里既等待又打断
@@ -175,10 +192,10 @@ dsh plugin --profile web add github:john-walks-slow/dsh-wait-subagent
 
 ## 权限与兼容
 
-- **涉及范围**：在每个 root agent 上注册四个模型可调用的 Agent 工具（`wait_subagent` / `get_subagent_status` / `wait_some_subagent` / `wait_every_subagent`）。无 web client、无 UI 改动、无配置项。
+- **涉及范围**：在每个 root agent 上注册五个模型可调用的 Agent 工具（`wait_subagent` / `get_subagent_status` / `wait_some_subagent` / `wait_every_subagent` / `send_to_subagent`）。无 web client、无 UI 改动、无配置项。
 - **阻塞语义**：等待类工具占用调用方 agent 的工具通道，直到目标子代理收尾、可选超时到期或调用方中止——这正是功能本身。等待机制是事件驱动（`subagent/end` 生命周期事件），非轮询，阻塞期间 CPU 占用可忽略。`get_subagent_status` 立即返回不阻塞。省略 `timeout_ms` 的等待不设上限（设计如此）；需要上限时请给足量级的 `timeout_ms`。
 - **无副作用**：无网络请求、无外部服务、无文件系统写入。活动表仅存于插件进程内存（重启即清空）。
-- **依赖**：运行时零依赖——`@deepseek-ai/dsh-tools` 为 peer 依赖，由 DSH 宿主提供（兼容范围：`^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`），Node ≥ 22.5。本地开发/验证钉版 0.1.2-rc.1（devDependencies）。
+- **依赖**：运行时零依赖——`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/dsh-llm` 均为 peer 依赖，由 DSH 宿主提供（兼容范围一致：`^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`，两者均为可选 peer，旧宿主可优雅降级），Node ≥ 22.5。两者本地开发/验证钉版 0.1.2-rc.1（devDependencies）。
 
 ## 本地开发
 
