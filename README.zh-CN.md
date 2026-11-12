@@ -5,13 +5,14 @@
   <a href="./README.zh-CN.md"><strong>简体中文</strong></a>
 </p>
 
-一个 DeepSeek Harness（cordis）插件，注册五个模型可调用的工具：
+一个 DeepSeek Harness（cordis）插件，注册六个面向模型的工具——五个 wait/send 工具在任何预设下都可用，另有一个只在被门禁的预设里注册的任务调度派发工具：
 
 - `wait_subagent` — **主动阻塞等待指定的后台 continuable 子代理收尾（settle），并在同一次调用里拿到它的停止原因与收尾消息**；超时返回附带活动诊断（最后活动时间/轮次/最近输出），可区分「仍在工作」与「疑似停滞」。
 - `get_subagent_status` — **非阻塞探活**：报告子代理是否仍在运行、距最后一次活动多久、最近输出摘要，用于中途判断「进行中 vs 静默停滞」。
 - `wait_some_subagent` — **等待多个后台子代理中首个收尾者**，返回其 id/停止原因/收尾消息，用于并行 fan-out 的逐个收割。
 - `wait_every_subagent` — **屏障：等待列出的所有后台子代理全部收尾**，按入参顺序返回每个子代理的结果外加 `failed` 失败清单，用于下一步需要全部 fan-out 结果的汇合点。
 - `send_to_subagent` — **向自己的后台子代理投递消息**：运行中的子代理在最近 step 边界消费（steer），空闲的子代理以此开启新 turn（followup）；已收尾的子代理如实返回不可投递。
+- `dispatch_tasks` — **经任务调度路由批量派发子代理**（受预设门禁约束）：`kind: "explore"` 走进程内 fork 子代理，继承父上下文并沿用父 agent 的推理强度；`kind: "execute"` 走进程内 spawn 子代理，运行在零决策的 `executor` 预设下，推理强度取最低档。`write_scope` 有重叠的任务按 FIFO 串行，作用域互不相交的任务并行；子代理 id 预先分配、立即返回，随后用等待类工具收割结果。
 
 三个等待类工具的**收尾语义均包含异常结束**：`error`、`aborted`、`max-tokens`、`refusal` 都算收尾（与正常结束触发同一个生命周期事件）；靠 `stop_reason` 区分成败，失败的子代理不会挂住等待。
 
@@ -129,13 +130,15 @@ send_to_subagent({ subagent_id: "id-a", message: "跳过文档步骤，直接去
 
 ## 工作原理
 
-- 在每个 root agent 上注册五个工具（与 `dsh-proactive` 相同的注册模式）。
+- 五个 wait/send 工具在每个 root agent 上注册（与 `dsh-proactive` 相同的注册模式）；`dispatch_tasks` 与回合收尾守卫则只注册在组合预设命中 `config.gate` 的 root agent 上（未配置 gate 时，这两类扩展对所有会话生效）。
 - **成员资格门控**：`ctx.subagents.listChildren(parent.id)` —— 与 `list_agents` 读的同一个 projection —— 同时覆盖存活与仅存于存储的子代理，未知 id 直接报错，而不是被误报为已收尾。已知子代理若不在存活注册表中，说明早已收尾。
 - 等待类工具监听 `subagent/end` 生命周期事件（子代理 activation 被释放时触发），作用域挂在插件上下文上（所有 agent 上下文的公共祖先）。`wait_every_subagent` 从同一事件流为每个列出的 id 记录一条结果，全部记录齐后才解除阻塞。
 - 收尾时，子代理从存活注册表移除与 `subagent/end` 派发发生在同一个同步块里（`finishDisposal`），因此"先挂监听、再复查注册表"的顺序无竞态。此时已不在注册表中的子代理被记为早已收尾（`stop_reason: "unknown"`）。
 - **活性观测（v1.1）**：插件上下文订阅 `subagent/assistant-output` 与 `agent/status` 事件，按子代理 id 维护活动表（最后活动时间、轮次、最近 5 条输出摘要各截 200 字符，上限追踪 256 个 id，LRU 淘汰）。payload 形状特征检测（`id`/`subagentId`/`agentId`/`agent.id`），未知形状忽略——事件缺失或形状不匹配时活性功能自动降级，不影响等待类工具。
 - 可选 `timeout_ms` 参数：超时返回附 `diagnostics`（`wait_every_subagent` 则为 `pending` 列表；未观测到活动如实报 `observed: false`）。省略则无限等待——通常这是最佳选择。
 - 尊重调用方的 `AbortSignal`（返回 `status: "cancelled"`）。
+- **写作用域仲裁**：宿主没有文件锁，因此派发器把归一化后 `write_scope` 前缀冲突的任务串行化（前缀相等或一方是另一方的祖先目录），作用域互不相交的任务并行执行；空作用域不占用任何槽位。
+- **回合收尾守卫**：订阅 `agent/pre-step` 与 `agent/turn-stopping` 事件；跑满 `guard.minSteps` 步的 root agent，在 `guard.requireGoal` 判定存在 active goal 时不能只以纯文本收尾。它对每个（agent, turn）最多推一次固定三选一的纠正消息（继续发起工具调用 / 给出已落盘文件的绝对路径与剩余 objective / 调用 `ask_user_question` 停机）。`DSH_TURN_CLOSE_GUARD=0` 可关闭该守卫。
 
 ## 工具签名
 
@@ -170,6 +173,13 @@ wait_every_subagent(subagent_ids: string[2+], timeout_ms?: integer)
 send_to_subagent(subagent_id: string, message: string)
 → { delivered: true,  subagent_id: string, mode: "steer" | "followup" }
   | { delivered: false, subagent_id: string, reason: "already_settled" }
+
+dispatch_tasks(tasks: [{ kind: "explore" | "execute", label: string,
+                         prompt: string, cwd?: string, write_scope?: string[] }])
+→ { tasks: [ { task_id: string, child_id: string,
+               kind: "explore" | "execute",
+               state: "started" | "queued" | "failed",
+               scope?: string[], error?: string } ] }
 ```
 
 ## 注意：不要在同一步里既等待又打断
@@ -192,7 +202,8 @@ dsh plugin --profile web add github:john-walks-slow/dsh-wait-subagent
 
 ## 权限与兼容
 
-- **涉及范围**：在每个 root agent 上注册五个模型可调用的 Agent 工具（`wait_subagent` / `get_subagent_status` / `wait_some_subagent` / `wait_every_subagent` / `send_to_subagent`）。无 web client、无 UI 改动、无配置项。
+- **涉及范围**：在每个 root agent 上注册五个模型可调用的 Agent 工具（`wait_subagent` / `get_subagent_status` / `wait_some_subagent` / `wait_every_subagent` / `send_to_subagent`），并在命中门禁预设的 root agent 上额外注册 `dispatch_tasks` 与回合收尾守卫。无 web client、无 UI 改动；`cordis.patch.yml` 中可选的 `config` 段负责门禁、路由、并发与守卫阈值。
+- **配置项**：`gate`（限定 `dispatch_tasks` 与守卫生效的预设 id）、`dispatch`（`tool`、`concurrency`）、`execute`（`provider`、`agentPreset`、`reasoningEffort`）、`explore`（`provider`）、`guard`（`enabled`、`minSteps`、`requireGoal`）。所有字段在加载时校验，错误信息统一带 `dsh-wait-subagent config:` 前缀。
 - **阻塞语义**：等待类工具占用调用方 agent 的工具通道，直到目标子代理收尾、可选超时到期或调用方中止——这正是功能本身。等待机制是事件驱动（`subagent/end` 生命周期事件），非轮询，阻塞期间 CPU 占用可忽略。`get_subagent_status` 立即返回不阻塞。省略 `timeout_ms` 的等待不设上限（设计如此）；需要上限时请给足量级的 `timeout_ms`。
 - **无副作用**：无网络请求、无外部服务、无文件系统写入。活动表仅存于插件进程内存（重启即清空）。
 - **依赖**：运行时零依赖——`@deepseek-ai/dsh-tools` 与 `@deepseek-ai/dsh-llm` 均为 peer 依赖，由 DSH 宿主提供（兼容范围一致：`^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`，两者均为可选 peer，旧宿主可优雅降级），Node ≥ 22.5。两者本地开发/验证钉版 0.1.2-rc.1（devDependencies）。
@@ -202,6 +213,7 @@ dsh plugin --profile web add github:john-walks-slow/dsh-wait-subagent
 ```bash
 npm install
 npm run verify        # 运行 scripts/verify.mjs —— 静态断言 + mock 功能测试
+node scripts/test-write-scope.mjs   # 写作用域单元测试（打印 PASS=/FAIL=）
 ```
 
 就这些——`lib/` 是纯 ESM JavaScript，没有构建步骤。

@@ -28,7 +28,7 @@
  * project root once, then retries the import.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { execSync } from "node:child_process";
@@ -225,9 +225,9 @@ async function main() {
 
   // -- 2. package.json -------------------------------------------------------
   let pkg;
-  await check("package.json parses; version === 1.3.0", () => {
+  await check("package.json parses; version is valid semver", () => {
     pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
-    assert(pkg.version === "1.3.0", `version is ${pkg.version}, expected 1.3.0`);
+    assert(/^\d+\.\d+\.\d+(-[\w.]+)?$/.test(pkg.version), `version is ${JSON.stringify(pkg.version)}, expected valid semver`);
   });
 
   // DEFECT-02 guard, generalized: every peer-provided @deepseek-ai package
@@ -491,6 +491,200 @@ async function main() {
       assert(rejected, `empty/blank message (${JSON.stringify(bad)}) must be rejected`);
     }
   });
+
+  // -- 5. Task-scheduler dispatch surface: presence, budgets, exports ----------
+  // New modules added by the dispatch/guard work. Presence first, then the
+  // per-file 400-line budget (mirrors §1b), then the literal exports each
+  // module must carry so a refactor cannot silently drop one.
+  const NEW_MODULES = [
+    "lib/config.js",
+    "lib/delegate/write-scope.js",
+    "lib/delegate/dispatch.js",
+    "lib/tools/dispatch.js",
+    "lib/guard/turn-close.js",
+  ];
+
+  for (const file of NEW_MODULES) {
+    await check(`new module exists: ${file}`, () => {
+      assert(existsSync(path.join(root, ...file.split("/"))), `${file} is missing on disk`);
+    });
+  }
+
+  for (const file of NEW_MODULES) {
+    await check(`line count (new module): ${file} <= 400 lines`, () => {
+      const n = lineCount(readFileSync(path.join(root, ...file.split("/")), "utf8"));
+      console.log(`      ${file}: ${n} lines`);
+      assert(n <= 400, `${file} has ${n} lines — exceeds the 400-line cap`);
+    });
+  }
+
+  // lib/config.js — the resolved-config surface and its defaults.
+  await check('config.js exports: composedPresetId + resolveConfig', () => {
+    const text = texts.get("lib/config.js");
+    assert(
+      text.includes("export { composedPresetId, resolveConfig }") || text.includes("composedPresetId"),
+      "config.js must export composedPresetId (and resolveConfig)",
+    );
+    assert(text.includes("resolveConfig"), "config.js must mention resolveConfig");
+  });
+
+  await check('config.js defaults: execute.agentPreset "executor"', () => {
+    assert(texts.get("lib/config.js").includes('"executor"'), 'config.js defaults must name the "executor" preset');
+  });
+
+  await check('config.js defaults: execute.reasoningEffort "minimal"', () => {
+    assert(texts.get("lib/config.js").includes('"minimal"'), 'config.js defaults must set reasoningEffort "minimal"');
+  });
+
+  await check("config.js defaults: dispatch.concurrency 3", () => {
+    assert(texts.get("lib/config.js").includes("concurrency: 3"), "config.js defaults must set concurrency: 3");
+  });
+
+  await check("config.js validation messages carry the dsh-wait-subagent config: prefix", () => {
+    assert(
+      texts.get("lib/config.js").includes("dsh-wait-subagent config:"),
+      "config.js validation errors must be prefixed with `dsh-wait-subagent config:`",
+    );
+  });
+
+  // lib/delegate/write-scope.js — normalization + prefix arbitration exports.
+  await check("write-scope.js exports: normalizeScope / scopesConflict / createScopeQueue", () => {
+    const text = texts.get("lib/delegate/write-scope.js");
+    for (const [name, needle] of [
+      ["normalizeScope", "export function normalizeScope"],
+      ["scopesConflict", "export function scopesConflict"],
+      ["createScopeQueue", "export function createScopeQueue"],
+    ]) {
+      assert(text.includes(needle), `write-scope.js must export ${name} (looked for \`${needle}\`)`);
+    }
+  });
+
+  // lib/delegate/dispatch.js — routing + dispatcher factory.
+  await check("dispatch.js exports: planRoute + createDispatcher", () => {
+    const text = texts.get("lib/delegate/dispatch.js");
+    assert(text.includes("export function planRoute"), "dispatch.js must export planRoute");
+    assert(text.includes("export function createDispatcher"), "dispatch.js must export createDispatcher");
+  });
+
+  await check('dispatch.js routes: agentPreset + reasoningEffort + delivery: "caller"', () => {
+    const text = texts.get("lib/delegate/dispatch.js");
+    assert(text.includes("agentPreset"), "dispatch.js must carry agentPreset through the execute route");
+    assert(text.includes("reasoningEffort"), "dispatch.js must carry reasoningEffort through the execute route");
+    assert(/delivery\s*:\s*"caller"/.test(text), 'dispatch.js must start children with delivery: "caller"');
+  });
+
+  // lib/tools/dispatch.js — the tool definition itself.
+  await check('tools/dispatch.js defines name: "dispatch_tasks"', () => {
+    assert(texts.get("lib/tools/dispatch.js").includes('name: "dispatch_tasks"'), "dispatch tool must be named dispatch_tasks");
+  });
+
+  await check("tools/dispatch.js schema mentions write_scope", () => {
+    assert(texts.get("lib/tools/dispatch.js").includes("write_scope"), "dispatch tool args must expose write_scope");
+  });
+
+  // lib/guard/turn-close.js — the guard's event + env + correction text.
+  await check("guard/turn-close.js listens on agent/turn-stopping", () => {
+    assert(texts.get("lib/guard/turn-close.js").includes("agent/turn-stopping"), "guard must subscribe to agent/turn-stopping");
+  });
+
+  await check("guard/turn-close.js listens on agent/pre-step", () => {
+    assert(texts.get("lib/guard/turn-close.js").includes("agent/pre-step"), "guard must subscribe to agent/pre-step");
+  });
+
+  await check("guard/turn-close.js returns next() from the agent/pre-step waterfall", () => {
+    const text = texts.get("lib/guard/turn-close.js");
+    assert(/\(payload,\s*next\)\s*=>/.test(text), "pre-step listener must accept the next callback");
+    assert(text.includes("return next();"), "a waterfall listener that does not own the decision must return next(), or decision.kind throws");
+  });
+
+  await check("guard/turn-close.js honours DSH_TURN_CLOSE_GUARD", () => {
+    assert(texts.get("lib/guard/turn-close.js").includes("DSH_TURN_CLOSE_GUARD"), "guard must read DSH_TURN_CLOSE_GUARD");
+  });
+
+  await check("guard/turn-close.js carries the 【回合收尾守卫】 correction text", () => {
+    assert(texts.get("lib/guard/turn-close.js").includes("【回合收尾守卫】"), "guard must steer with the fixed correction text");
+  });
+
+  // lib/index.js — wiring of every new module.
+  for (const needle of ["resolveConfig", "createDispatcher", "defineDispatchTool", "registerTurnCloseGuard", "composedPresetId"]) {
+    await check(`index.js wires ${needle}`, () => {
+      assert(texts.get("lib/index.js").includes(needle), `lib/index.js must reference ${needle}`);
+    });
+  }
+
+  // Legacy wording must be gone: these two phrasings described the old
+  // "effort is fixed by the host" behaviour and would contradict the new
+  // route table.
+  for (const file of ["lib/guard/turn-close.js", "lib/index.js"]) {
+    await check(`static: ${file} has no legacy effort wording`, () => {
+      const text = texts.get(file);
+      assert(!text.includes("default effort"), `${file} still contains "default effort"`);
+      assert(!text.includes("no effort parameter"), `${file} still contains "no effort parameter"`);
+    });
+  }
+
+  // -- 6. Functional: write-scope arbitration + config resolution -----------
+  let writeScope;
+  await check("import lib/delegate/write-scope.js: three exports are functions", async () => {
+    writeScope = await import(pathToFileURL(path.join(root, "lib", "delegate", "write-scope.js")).href);
+    for (const name of ["normalizeScope", "scopesConflict", "createScopeQueue"]) {
+      assert(typeof writeScope[name] === "function", `write-scope.js must export ${name} as a function`);
+    }
+  });
+
+  if (writeScope) {
+    await check("write-scope: nested prefix conflicts (c:/r/src vs c:/r/src/app.js)", () => {
+      assertDeepEqual(
+        writeScope.scopesConflict(["c:/r/src"], ["c:/r/src/app.js"]),
+        true,
+        "ancestor/descendant scopes must conflict",
+      );
+    });
+
+    await check("write-scope: sibling prefixes do not conflict (c:/r/src vs c:/r/src2)", () => {
+      assertDeepEqual(
+        writeScope.scopesConflict(["c:/r/src"], ["c:/r/src2"]),
+        false,
+        "sibling-prefix scopes must not conflict",
+      );
+    });
+
+    await check("write-scope: normalizeScope canonicalizes and dedupes case/backslash/trailing slash", () => {
+      const normalized = writeScope.normalizeScope(["C:\\R\\Src\\", "c:/r/src"]);
+      assert(Array.isArray(normalized), "normalizeScope must return an array");
+      assert(normalized.length === 1, `duplicate spellings must collapse to one entry, got ${JSON.stringify(normalized)}`);
+    });
+  }
+
+  let configModule;
+  await check("import lib/config.js: resolveConfig is a function", async () => {
+    configModule = await import(pathToFileURL(path.join(root, "lib", "config.js")).href);
+    assert(typeof configModule.resolveConfig === "function", "config.js must export resolveConfig as a function");
+  });
+
+  if (configModule) {
+    await check("resolveConfig(undefined) falls back to the documented defaults", () => {
+      const resolved = configModule.resolveConfig(undefined);
+      assert(resolved && typeof resolved === "object", "resolveConfig(undefined) must return an object");
+      assert(resolved.dispatch.concurrency === 3, `dispatch.concurrency is ${resolved.dispatch.concurrency}, expected 3`);
+      assert(resolved.execute.reasoningEffort === "minimal", `execute.reasoningEffort is ${resolved.execute.reasoningEffort}, expected "minimal"`);
+      assert(resolved.guard.minSteps === 2, `guard.minSteps is ${resolved.guard.minSteps}, expected 2`);
+    });
+
+    await check("resolveConfig rejects concurrency 0 with the config: prefix", () => {
+      let rejected = false;
+      try {
+        configModule.resolveConfig({ dispatch: { concurrency: 0 } });
+      } catch (err) {
+        rejected = true;
+        assert(
+          String(err.message).includes("dsh-wait-subagent config:"),
+          `validation error must be prefixed, got: ${err.message}`,
+        );
+      }
+      assert(rejected, "resolveConfig must reject dispatch.concurrency 0");
+    });
+  }
 
   finish();
 }

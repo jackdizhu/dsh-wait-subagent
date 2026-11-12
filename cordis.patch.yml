@@ -1,5 +1,22 @@
 # dsh-wait-subagent — profile patch layer
 # Inserts one loader entry for the plugin package.
+# config.gate 只约束 dispatch_tasks 与回合收尾守卫；五个 wait/send 工具在任何预设下都可用。
+# 想全局生效就删掉 gate 一行（或改成空值），守卫与派发工具即对所有会话开放。
 - insert:
     - id: wait-subagent
       name: 'dsh-wait-subagent'
+      config:
+        gate: task-scheduler
+        dispatch:
+          tool: true
+          concurrency: 3
+        execute:
+          provider: spawn
+          agentPreset: executor
+          reasoningEffort: minimal
+        explore:
+          provider: fork
+        guard:
+          enabled: true
+          minSteps: 2
+          requireGoal: true

@@ -5,13 +5,14 @@
   <a href="./README.zh-CN.md"><strong>简体中文</strong></a>
 </p>
 
-A DeepSeek Harness (cordis) plugin that registers five model-facing tools:
+A DeepSeek Harness (cordis) plugin that registers six model-facing tools — five wait/send tools that are available in every preset, plus a task-scheduler dispatch tool that is only registered in the gated preset:
 
 - `wait_subagent` — **block until a background continuable subagent settles, then get its stop reason and closing message** in the same call; timeouts carry activity diagnostics (last activity age, turn count, recent outputs) so you can tell "still working" from "likely stalled".
 - `get_subagent_status` — **non-blocking liveness probe**: is the child still running, how long since its last activity, what did it recently output — for mid-flight "working vs silently stalled" decisions.
 - `wait_some_subagent` — **wait for the FIRST of several background subagents to settle**, returning that id / stop reason / closing message — for harvesting parallel fan-out dispatches one by one.
 - `wait_every_subagent` — **barrier: wait for ALL of the listed background subagents to settle**, returning every child's result in input order plus a `failed` list — for joins where your next step needs all fan-out results at once.
 - `send_to_subagent` — **deliver a message to one of your own background subagents** while it runs (steered at the nearest step boundary) or when it is idle between turns (opens a new follow-up turn); settled children are reported honestly as not delivered.
+- `dispatch_tasks` — **dispatch a batch of sub-agents through the task-scheduler routing** (preset-scoped): `kind: "explore"` runs an in-process fork child that inherits the parent context and keeps the parent's reasoning effort; `kind: "execute"` runs an in-process spawn child under the zero-decision `executor` preset at the lowest reasoning effort. Tasks sharing a `write_scope` are serialized FIFO, disjoint scopes run in parallel, and pre-allocated child ids come back immediately so you can harvest with the wait tools.
 
 Across the three wait tools, **settlement includes abnormal endings**: `error`, `aborted`, `max-tokens`, and `refusal` all count as settled (each fires the same lifecycle event as a normal finish); `stop_reason` tells success from failure, so a failing child can never hang a wait.
 
@@ -129,13 +130,15 @@ What's missing: after starting a subagent in the background, there is no tool to
 
 ## How it works
 
-- Registers five tools on every root agent (same pattern as `dsh-proactive`).
+- Registers the five wait/send tools on every root agent (same pattern as `dsh-proactive`), plus `dispatch_tasks` and the turn-close guard on root agents whose composed preset matches `config.gate` (when no gate is configured, the extras are active everywhere).
 - **Membership gate**: `ctx.subagents.listChildren(parent.id)` — the same projection `list_agents` reads — covers live AND storage-only children, so unknown ids are rejected with an error instead of being misreported as settled. A known child absent from the live registry has already settled.
 - The waiting tools listen for the `subagent/end` lifecycle event — which fires when a child's activation is disposed — scoped through the plugin context (an ancestor of all agent contexts). `wait_every_subagent` records one result per listed id from the same event stream and resolves only once every id is recorded.
 - Settlement removes the child from the live registry and dispatches `subagent/end` in the same synchronous block (`finishDisposal`), so attaching the listener first and then re-checking the registry is race-free. A child missing from the registry at that point is recorded as already settled (`stop_reason: "unknown"`).
 - **Liveness tracking (v1.1)**: the plugin context subscribes to `subagent/assistant-output` and `agent/status`, maintaining a per-child activity table (last activity time, turn count, last 5 output snippets of 200 chars each, 256-id LRU cap). Payload shapes are feature-detected (`id` / `subagentId` / `agentId` / `agent.id`); unknown shapes are ignored — if the events are missing or shaped differently, liveness features degrade gracefully and the waiting tools keep working.
 - Optional `timeout_ms` returns `status: "timeout"` with `diagnostics` (or, for `wait_every_subagent`, the `pending` list; honest `observed: false` when nothing was seen). Omit to wait indefinitely — usually the best choice.
 - Respects the caller's `AbortSignal` (returns `status: "cancelled"`).
+- **Write-scope arbitration**: the host has no file lock, so the dispatcher serializes tasks whose normalized `write_scope` prefixes collide (equal or one is an ancestor of the other) and runs disjoint scopes concurrently; an empty scope never occupies a slot.
+- **Turn-close guard**: subscribes to `agent/pre-step` and `agent/turn-stopping`; a root agent that ran at least `guard.minSteps` steps may not close a turn on pure prose when `guard.requireGoal` finds an active goal. It steers at most once per (agent, turn) with a fixed three-way correction (continue with tool calls / name the files already written plus the remaining objective / `ask_user_question` and stop). `DSH_TURN_CLOSE_GUARD=0` disables it.
 
 ## Tool schema
 
@@ -170,6 +173,13 @@ wait_every_subagent(subagent_ids: string[2+], timeout_ms?: integer)
 send_to_subagent(subagent_id: string, message: string)
 → { delivered: true,  subagent_id: string, mode: "steer" | "followup" }
   | { delivered: false, subagent_id: string, reason: "already_settled" }
+
+dispatch_tasks(tasks: [{ kind: "explore" | "execute", label: string,
+                         prompt: string, cwd?: string, write_scope?: string[] }])
+→ { tasks: [ { task_id: string, child_id: string,
+               kind: "explore" | "execute",
+               state: "started" | "queued" | "failed",
+               scope?: string[], error?: string } ] }
 ```
 
 ## Caveat: don't wait and interrupt in the same step
@@ -196,7 +206,8 @@ Restart your DSH instance after installing; the bundled `cordis.patch.yml` regis
 
 ## Permissions & compatibility
 
-- **What it touches**: registers exactly five model-facing Agent tools (`wait_subagent`, `get_subagent_status`, `wait_some_subagent`, `wait_every_subagent`, `send_to_subagent`) on every root agent. No web client, no UI changes, no configuration.
+- **What it touches**: registers five model-facing Agent tools (`wait_subagent`, `get_subagent_status`, `wait_some_subagent`, `wait_every_subagent`, `send_to_subagent`) on every root agent, plus `dispatch_tasks` and the turn-close guard on root agents in the gated preset. No web client, no UI changes; the optional `config` block in `cordis.patch.yml` controls the gate, routing, concurrency and guard thresholds.
+- **Configuration**: `gate` (preset id scoping `dispatch_tasks` + guard), `dispatch` (`tool`, `concurrency`), `execute` (`provider`, `agentPreset`, `reasoningEffort`), `explore` (`provider`), `guard` (`enabled`, `minSteps`, `requireGoal`). Every field is validated at load with a `dsh-wait-subagent config:` prefix.
 - **Blocking semantics**: the waiting tools hold the calling agent's tool lane until the targets settle, the optional timeout elapses, or the caller aborts — that is the feature. The wait itself is event-driven (`subagent/end` lifecycle event), not polling; CPU cost while blocked is negligible. `get_subagent_status` returns immediately and never blocks. An omit-`timeout_ms` wait is unbounded by design; set a generous `timeout_ms` when you need a bound.
 - **No side effects**: no network requests, no external services, no filesystem writes. The activity table lives in plugin process memory only (cleared on restart).
 - **Dependencies**: none at runtime — `@deepseek-ai/dsh-tools` and `@deepseek-ai/dsh-llm` are peer dependencies provided by the DSH host (identical range `^0.1.0-rc.2 || ^0.1.1-rc.1 || 0.1.2-rc.1 || ^0.1.5-rc.1 || ^0.1.7-rc.1 || >=0.2.0-rc.2`, both optional peers so older hosts degrade gracefully), Node ≥ 22.5. Dev/validation pin for both: 0.1.2-rc.1 (devDependencies).
@@ -206,6 +217,7 @@ Restart your DSH instance after installing; the bundled `cordis.patch.yml` regis
 ```bash
 npm install
 npm run verify        # runs scripts/verify.mjs — static + mock functional checks
+node scripts/test-write-scope.mjs   # write-scope unit tests (PASS=/FAIL=)
 ```
 
 That's it — `lib/` is plain ESM JavaScript; there is no build step.
